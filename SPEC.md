@@ -1,6 +1,6 @@
 # Symphony2 Sequential Agent Runner Specification
 
-Status: Draft v0.1
+Status: Draft v0.2
 
 Purpose: Define a small orchestration service that processes project tickets one at a time in a
 single repository working copy, while allowing humans to choose which coding agent should handle
@@ -24,6 +24,11 @@ The design optimizes for:
 - support for multiple agent backends;
 - resumability after crashes;
 - clear human review points.
+
+Public GitHub hosting is used only to develop and distribute Symphony2 itself. Tasks executed by a
+user's local Symphony2 installation are private local data and MUST NOT be published to this
+repository, GitHub Issues, GitHub Projects, pull request descriptions, commit messages, or logs by
+default.
 
 ## 2. Core Invariants
 
@@ -50,6 +55,7 @@ The runner intentionally does not provide:
 - a rich multi-tenant web control plane;
 - automatic replacement of a manually selected agent with a different agent;
 - generic business-process automation outside the ticket execution loop.
+- public task tracking for user projects.
 
 Implementations MAY add optional branches, worktrees, dashboards, or parallel workers later, but
 those features are outside this baseline spec.
@@ -198,10 +204,12 @@ Minimal example:
 ```md
 ---
 tracker:
-  kind: linear
-  project: example
+  kind: local
+  state_path: .symphony2/state.sqlite
+  ticket_prefix: LOCAL
   active_states: ["Todo", "In Progress"]
-  terminal_states: ["Done", "Cancelled"]
+  handoff_states: ["Human Review"]
+  terminal_states: ["Done", "Cancelled", "Blocked"]
 
 repo:
   path: .
@@ -214,8 +222,7 @@ queue:
 
 agents:
   codex:
-    kind: codex_app_server
-    command: codex app-server
+    kind: codex_sdk
     default: true
     enabled: true
   claude:
@@ -225,12 +232,16 @@ agents:
 
 agent_selection:
   manual_sources:
-    - type: custom_field
-      name: Agent
-    - type: label_prefix
+    - type: ticket_field
+      name: agent
+    - type: tag_prefix
       prefix: "agent:"
   fallback_agent: codex
   unavailable_policy: block_ticket
+
+validation:
+  commands:
+    - npm test
 ---
 
 You are working on ticket {{ ticket.identifier }}.
@@ -246,15 +257,88 @@ Do not start unrelated work.
 
 Unknown config keys SHOULD be ignored for forward compatibility.
 
-## 7. Agent Selection
+## 7. Implementation Tech Stack
+
+The baseline implementation SHOULD use this stack:
+
+- Language/runtime: TypeScript on the current Node.js LTS.
+- Package manager: Yarn 4 via Corepack.
+- Install mode: `nodeLinker: node-modules` in `.yarnrc.yml`.
+- CLI framework: `commander`.
+- Config parser: Markdown with YAML front matter.
+- Config and domain validation: `zod`.
+- State database: SQLite in WAL mode.
+- SQLite driver: `better-sqlite3`.
+- SQL layer: `kysely`.
+- Logging: structured JSON logs to stdout and `.symphony2/logs/`.
+- Tests: `vitest`.
+- Git operations: native `git` subprocess commands.
+- First tracker adapter: local SQLite tracker.
+- First agent adapter: Codex SDK.
+- Second agent adapter: generic CLI subprocess.
+- Optional later agent adapter: Codex app-server.
+- Optional later external integrations: Linear tracker and GitHub PR integration.
+
+The baseline MUST NOT require any external tracker service. All ticket data needed to run the MVP
+must live locally.
+
+### 7.1 Local Runtime Files
+
+By default, runtime files live under `.symphony2/` in the controlled repository:
+
+- `.symphony2/state.sqlite`: local tracker, runner state, leases, and run history.
+- `.symphony2/logs/`: structured logs and agent transcript summaries.
+- `.symphony2/artifacts/`: optional validation evidence, screenshots, or generated reports.
+
+The implementation SHOULD add `.symphony2/` to the controlled repository's `.gitignore`, unless the
+user explicitly wants to version local tickets.
+
+### 7.2 Local Tracker
+
+The local tracker is the authoritative baseline task source.
+
+It MUST support:
+
+- creating tickets locally;
+- listing eligible tickets;
+- editing title, description, state, priority, tags, and selected agent;
+- appending workpad/progress notes;
+- recording validation evidence;
+- preserving run history after completion.
+
+Suggested CLI commands:
+
+```text
+symphony2 ticket create
+symphony2 ticket list
+symphony2 ticket show <ticket>
+symphony2 ticket update <ticket>
+symphony2 ticket set-agent <ticket> <agent>
+symphony2 run
+symphony2 status
+symphony2 pause
+symphony2 resume
+symphony2 doctor
+```
+
+Local ticket identifiers SHOULD use the configured prefix, for example `LOCAL-1`, `LOCAL-2`, and
+`LOCAL-3`.
+
+GitHub MAY be used for publishing branches and pull requests later, but GitHub Issues MUST NOT be
+the baseline tracker. This avoids publishing private task context for public repositories.
+
+The public Symphony2 repository is only the distribution and development repository for the tool.
+It is not a task database for installations of the tool.
+
+## 8. Agent Selection
 
 Manual selection MUST take precedence over routing defaults.
 
 Resolution order:
 
-1. Tracker custom field, for example `Agent = codex`.
-2. Tracker label with configured prefix, for example `agent:codex`.
-3. Command comment, for example `/agent codex`, if implemented.
+1. Local ticket field, for example `agent = codex`.
+2. Local ticket tag with configured prefix, for example `agent:codex`.
+3. Operator CLI override, for example `symphony2 ticket set-agent LOCAL-1 codex`.
 4. Routing rules.
 5. Fallback default agent.
 
@@ -269,7 +353,7 @@ If a manually selected agent is unavailable, disabled, or unknown, the runner MU
 different agent. It MUST block the ticket or ask for human intervention according to
 `agent_selection.unavailable_policy`.
 
-## 8. Queue and Dispatch
+## 9. Queue and Dispatch
 
 The runner has two high-level states:
 
@@ -297,7 +381,7 @@ When running:
 
 The runner MUST NOT dispatch a second ticket while any run is active.
 
-## 9. Repository Safety
+## 10. Repository Safety
 
 Before starting a ticket, the runner MUST inspect the repository.
 
@@ -326,7 +410,7 @@ Allowed repository end states are implementation-defined. Common policies:
 
 The chosen policy MUST be documented in config.
 
-## 10. Stages
+## 11. Stages
 
 Default stages:
 
@@ -365,7 +449,7 @@ Default stages:
 Implementations MAY combine stages, but persisted state MUST be detailed enough to resume or safely
 stop after a crash.
 
-## 11. Tracker State Mapping
+## 12. Tracker State Mapping
 
 The runner SHOULD support configurable tracker states.
 
@@ -383,7 +467,7 @@ Example state map:
 If the active ticket moves to a terminal state while a run is active, the runner SHOULD stop the
 agent and release the lease after repository safety checks.
 
-## 12. Agent Adapter Contract
+## 13. Agent Adapter Contract
 
 All agent adapters expose the same logical operations:
 
@@ -420,7 +504,7 @@ The runner SHOULD normalize events into a small shared event model:
 
 Adapters that cannot provide structured events MAY emit `agent_log` and final status only.
 
-## 13. Prompt Contract
+## 14. Prompt Contract
 
 The prompt template receives:
 
@@ -446,7 +530,7 @@ The rendered prompt SHOULD include:
 
 Unknown template variables SHOULD fail rendering rather than silently producing incomplete prompts.
 
-## 14. State Store
+## 15. State Store
 
 The implementation MUST persist state outside process memory.
 
@@ -455,6 +539,9 @@ Acceptable storage:
 - SQLite;
 - JSON files with atomic writes;
 - another durable local database.
+
+The baseline implementation MUST use SQLite. JSON files may be used for export/import or debugging,
+but not as the primary state store.
 
 Required records:
 
@@ -470,7 +557,7 @@ Required records:
 The state store MUST support crash recovery. On startup, the runner MUST reconcile local state,
 tracker state, and repository state before dispatching new work.
 
-## 15. Crash Recovery
+## 16. Crash Recovery
 
 On startup:
 
@@ -487,7 +574,7 @@ On startup:
 
 The runner MUST prefer stopping over starting a new ticket when state is ambiguous.
 
-## 16. Retry Policy
+## 17. Retry Policy
 
 Retries are allowed only for the current active ticket.
 
@@ -510,7 +597,7 @@ Non-retryable conditions:
 - ambiguous crash recovery state;
 - missing required human approval.
 
-## 17. Human Control
+## 18. Human Control
 
 Humans must be able to:
 
@@ -526,7 +613,7 @@ If a human changes the selected agent while a run is already active, the impleme
 whether the change applies immediately, after cancellation, or only to the next run. The baseline
 policy is: agent changes apply only before execution starts.
 
-## 18. Observability
+## 19. Observability
 
 At minimum, the runner MUST emit structured logs containing:
 
@@ -551,7 +638,7 @@ The runner SHOULD expose a simple status command or endpoint showing:
 - last error;
 - last validation summary.
 
-## 19. Security and Permissions
+## 20. Security and Permissions
 
 The runner executes agents against a real repository checkout. Implementations MUST document:
 
@@ -564,25 +651,56 @@ The runner executes agents against a real repository checkout. Implementations M
 
 The runner MUST NOT expose a remote control surface without authentication.
 
-## 20. Definition of Done
+### 20.1 Task Privacy Boundary
+
+Executed task data is private by default.
+
+The runner MUST NOT send local ticket content, workpad notes, agent transcripts, validation logs,
+repository paths, screenshots, or generated artifacts to public GitHub surfaces unless the operator
+explicitly asks for that export.
+
+Public GitHub surfaces include:
+
+- GitHub Issues;
+- GitHub Projects;
+- pull request titles and descriptions;
+- pull request comments;
+- commit messages;
+- release notes;
+- Actions logs;
+- uploaded artifacts.
+
+If a future GitHub PR integration is added, it MUST use a privacy-preserving summary by default:
+
+- mention that Symphony2 produced or assisted with the change;
+- include changed files and validation commands when safe;
+- omit local ticket descriptions, private notes, customer data, secrets, local paths, and full agent
+  transcripts.
+
+The local tracker remains the source of truth for executed tasks. Exporting a task outside the local
+state store is an explicit operator action, not default behavior.
+
+## 21. Definition of Done
 
 A baseline implementation is complete when it can:
 
 - load `RUNNER.md`;
-- fetch eligible tickets from one tracker;
+- create and fetch eligible tickets from the local SQLite tracker;
 - run in single-ticket mode;
 - acquire and renew a repository lease;
 - reject new work when the repo is unsafe;
-- select an agent manually from tracker metadata;
+- select an agent manually from the local ticket field or tag metadata;
 - fall back to a default agent only when no manual selection exists;
-- run at least one agent adapter;
-- persist run state;
+- run the Codex SDK agent adapter;
+- run the generic CLI agent adapter;
+- persist run state in SQLite;
 - recover safely after restart;
-- update ticket progress;
+- update local ticket progress;
 - record validation evidence;
+- keep executed task data out of public GitHub surfaces by default;
 - release the lease and move to the next ticket only after safe completion.
 
-## 21. Example Lifecycle
+## 22. Example Lifecycle
 
 ```text
 runner starts
@@ -590,17 +708,17 @@ runner starts
   -> repo is clean
   -> no active lease
   -> fetches tickets
-  -> picks APP-42
-  -> sees label agent:codex
+  -> picks LOCAL-1
+  -> sees ticket field agent=codex
   -> records selected_agent=codex
   -> acquires repo lease
-  -> moves APP-42 to In Progress
+  -> moves LOCAL-1 to In Progress
   -> runs intake
   -> runs plan
   -> runs execute
   -> runs validate
   -> creates handoff summary
-  -> moves APP-42 to Human Review
+  -> moves LOCAL-1 to Human Review
   -> verifies repo end state is allowed
   -> releases lease
   -> returns to idle
